@@ -10,7 +10,23 @@ from torch.nn import functional as F
 import os
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, PngImagePlugin
+import glob 
+from tqdm import tqdm 
+import argparse
+import sys
+import pickle
+
+
+Image.MAX_IMAGE_PIXELS = 10000000000000000
+LARGE_ENOUGH_NUMBER = 100
+PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
+
+parser = argparse.ArgumentParser(description="clean")
+parser.add_argument('--src', type=str, default="./")
+parser.add_argument('--dst', type=str, default="examples")
+parser.add_argument('--n_thread', type=int, default=12)
+args = parser.parse_args()
 
 
  # hacky way to deal with the Pytorch 1.0 update
@@ -113,7 +129,6 @@ def load_model():
     model.eval()
 
 
-
     # the following is deprecated, everything is migrated to python36
 
     ## if you encounter the UnicodeDecodeError when use python3 to load the model, add the following line will fix it. Thanks to @soravux
@@ -134,59 +149,79 @@ def load_model():
 # load the labels
 classes, labels_IO, labels_attribute, W_attribute = load_labels()
 
-# load the model
-features_blobs = []
-model = load_model()
-
 # load the transformer
 tf = returnTF() # image transformer
 
-# get the softmax weight
-params = list(model.parameters())
-weight_softmax = params[-2].data.numpy()
-weight_softmax[weight_softmax<0] = 0
+# load the model
+model = load_model().cuda()
+
+
 
 # load the test image
-img_url = 'http://places.csail.mit.edu/demo/6.jpg'
-os.system('wget %s -q -O test.jpg' % img_url)
-img = Image.open('test.jpg')
-input_img = V(tf(img).unsqueeze(0))
+filelist = glob.glob(os.path.join(args.src,  "*.png"))
+stock = {}
+for i in tqdm(range(len(filelist))):
+    fpath = filelist[i]
+    basename = os.path.basename(fpath)
+    img = Image.open(fpath)
+    input_img = V(tf(img).unsqueeze(0)).cuda()
+    features_blobs = []
+    tmp = {}
 
-# forward pass
-logit = model.forward(input_img)
-h_x = F.softmax(logit, 1).data.squeeze()
-probs, idx = h_x.sort(0, True)
-probs = probs.numpy()
-idx = idx.numpy()
+    # forward pass
+    with torch.no_grad():
+        logit = model.forward(input_img)
+    
+    pred = np.array(logit.cpu().numpy()).reshape((365,1))
+    tmp["scene_score"] = pred
+    
+#     h_x = F.softmax(logit.cpu(), 1).data.squeeze()
+#     probs, idx = h_x.sort(0, True)
+#     probs = probs.numpy()
+#     idx = idx.numpy()
+#     print('RESULT ON ' + "unsplash_mCfPPUeQux4")
 
-print('RESULT ON ' + img_url)
+#     # output the IO prediction
+#     io_image = np.mean(labels_IO[idx[:10]]) # vote for the indoor or outdoor
+#     if io_image < 0.5:
+#         print('--TYPE OF ENVIRONMENT: indoor')
+#     else:
+#         print('--TYPE OF ENVIRONMENT: outdoor')
 
-# output the IO prediction
-io_image = np.mean(labels_IO[idx[:10]]) # vote for the indoor or outdoor
-if io_image < 0.5:
-    print('--TYPE OF ENVIRONMENT: indoor')
-else:
-    print('--TYPE OF ENVIRONMENT: outdoor')
+#     # output the prediction of scene category
+#     print('--SCENE CATEGORIES:')
+#     for i in range(0, 5):
+#         print('{:.3f} -> {}'.format(probs[i], classes[idx[i]]))
 
-# output the prediction of scene category
-print('--SCENE CATEGORIES:')
-for i in range(0, 5):
-    print('{:.3f} -> {}'.format(probs[i], classes[idx[i]]))
+    # output the scene attributes
+    responses_attribute = W_attribute.dot(features_blobs[1])
+    tmp["attr_score"] = (responses_attribute.reshape(-1,1))
+    
+    stock[basename] = tmp
 
-# output the scene attributes
-responses_attribute = W_attribute.dot(features_blobs[1])
-idx_a = np.argsort(responses_attribute)
-print('--SCENE ATTRIBUTES:')
-print(', '.join([labels_attribute[idx_a[i]] for i in range(-1,-10,-1)]))
+with open(f'../{args.dst}.pickle', 'wb') as handle:
+    pickle.dump(stock, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        
+    
+#     idx_a = np.argsort(responses_attribute)
+#     print('--SCENE ATTRIBUTES:')
+#     print(', '.join([labels_attribute[idx_a[i]] for i in range(-1,-10,-1)]))
 
 
-# generate class activation mapping
-print('Class activation map is saved as cam.jpg')
-CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[0]])
+# # get the softmax weight
+# params = list(model.parameters())
+# weight_softmax = params[-2].data.numpy()
+# weight_softmax[weight_softmax<0] = 0
 
-# render the CAM and output
-img = cv2.imread('test.jpg')
-height, width, _ = img.shape
-heatmap = cv2.applyColorMap(cv2.resize(CAMs[0],(width, height)), cv2.COLORMAP_JET)
-result = heatmap * 0.4 + img * 0.5
-cv2.imwrite('cam.jpg', result)
+
+
+# # generate class activation mapping
+# print('Class activation map is saved as cam.jpg')
+# CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[0]])
+
+# # render the CAM and output
+# img = np.array(Image.open('/data04/t-yazen/miniupp4k/unsplash_mCfPPUeQux4.png'))
+# height, width, _ = img.shape
+# heatmap = cv2.applyColorMap(cv2.resize(CAMs[0],(width, height)), cv2.COLORMAP_JET)
+# result = heatmap * 0.4 + img * 0.5
+# cv2.imwrite('cam.jpg', result)
